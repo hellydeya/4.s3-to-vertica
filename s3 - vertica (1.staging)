@@ -1,0 +1,135 @@
+from airflow import DAG
+import logging
+import boto3
+import pandas as pd
+import vertica_python
+import json
+from airflow.operators.python import PythonOperator
+from airflow.models.variable import Variable
+from datetime import datetime
+from os import listdir
+from time import sleep
+
+logging = logging.getLogger(__name__)
+
+connection_vertica = vertica_python.connect(**json.loads(Variable.get("VERTICA_CONNECTION")))
+
+file_path, bucket = Variable.get("S3_FILE_PATH"), Variable.get("s3_b")
+
+def sql_read_file(file_name):
+    with open(f'--- hello ---.sql', 'r') as sql:
+        return sql.read()
+
+def load_from_s3(ti):
+    session = boto3.session.Session()
+
+    s3_client = session.client(
+        service_name='s3',
+        endpoint_url=Variable.get("AWS_URL"),
+        aws_access_key_id=Variable.get("AWS_SERVER_PUBLIC_KEY"),
+        aws_secret_access_key=Variable.get("AWS_SERVER_SECRET_KEY"),
+        )
+    
+    bucket_list, load_list, block_list = [], [], []
+
+    for data in s3_client.list_objects(Bucket=bucket)['Contents']:
+        bucket_list.append(data['Key'])        
+
+        file_name = file_path + data['Key']
+
+        if data['Key'] not in listdir(file_path):
+            try:
+                s3_client.download_file(bucket, data['Key'], file_name)
+                logging.debug(f"LOADING: {data['Key']} SUCCESS")
+                load_list.append(data['Key'])
+            except:
+                logging.warning(f"FILE: {data['Key']} DON'T LOAD, GO HARD!")
+                block_list.append(data['Key'])
+
+    ti.xcom_push(key='filename', value=load_list)
+
+    logging.debug(f"NEXT FILES FIND IN BUCKET {bucket}: {bucket_list}") if bucket_list else logging.warning(f"NO FILES IN BUCKET {bucket}")
+    logging.info(f"NEXT FILES HAS BIN LOADED: {load_list}") if load_list else logging.info(f"NO NEW FILES TO DOWNLOAD")
+    if block_list: logging.warning(f"NOT DOWNLOADED FILE: {load_list}") 
+    logging.info(f"EVERYTHING IS FINE! GO NEXT....") if all([bucket_list, not block_list]) else logging.warning(f"SHIT, GO HARD!")
+
+
+
+def files_wait(ti):
+    file_list = ti.xcom_pull(task_ids='load_from_s3', key='filename')
+
+    time_sleep = 0
+    while not(set(file_list) <= set(listdir(file_path))):
+        sleep(1)
+        time_sleep += 1
+        if time_sleep > 60: break
+    else:
+        return True
+    logging.warning(f"TIMEOUT....FILES: {set(file_list).difference(set(listdir(file_path)))} NOT LOAD! GO HARD!")
+    return False
+    
+def load_to_staging(ti):
+    load_list, block_list = [], []
+
+    local_file = listdir(file_path)
+    loaded_file = ti.xcom_pull(task_ids='load_from_s3', key='filename')
+
+    if all([local_file, loaded_file]):        
+        try:
+            with connection_vertica.cursor() as cursor:
+                cursor.execute(sql_read_file('stg_truncate_currencies')) 
+                cursor.execute(sql_read_file('stg_truncate_transactions'))
+
+        except Exception as e:
+            logging.warning(f"\n{e}")
+
+        for file in local_file:
+            if any(s in file for s in ('currencies', 'transaction')):
+                file_name = f'{file_path}{file}'
+                try:
+                    df = pd.read_csv(file_name, chunksize=10**6) 
+                    sql = (sql_read_file('stg_load_currencies_stdin') if 'currencies' in file else sql_read_file('stg_load_transactions_stdin'))
+
+                    for data in df:
+                        with connection_vertica.cursor() as cursor:
+                            cursor.copy(sql, data.to_csv(header=None, index=False))
+
+                    load_list.append(file)              
+
+                except Exception as e:
+                    logging.warning(f"\n{e}")
+                    logging.warning(f"FILE: {file_name} NOT LOAD")
+                    block_list.append(file)
+    else:
+        logging.info(f"NEW FILES ARE MISSING") if local_file else logging.warning(f"NO FILES TO LOAD IN LOCAL FOLDER") 
+
+    logging.info(f"NEXT FILES HAS BIN LOADED: {load_list}") if load_list else logging.info(f"NO FILES LOADED")
+    if block_list: logging.info(f"NOT DOWNLOADED FILE: {block_list}") 
+        
+with DAG(
+        'DAG_s3_to_staging',
+        tags=['DAG_s3_to_staging'],
+        start_date=datetime(2022, 10, 1),
+        end_date=None,
+        schedule_interval=None,
+        is_paused_upon_creation=True,
+        max_active_runs=1,
+        catchup = False,
+        ) as dag:
+    
+    load_from_s3 = PythonOperator(
+        task_id='load_from_s3',
+        provide_context=True,
+        python_callable=load_from_s3)
+    
+    files_wait = PythonOperator(
+        task_id='files_wait',
+        provide_context=True,
+        python_callable=files_wait)
+    
+    load_to_staging = PythonOperator(
+        task_id='load_to_staging',
+        provide_context=True,
+        python_callable=load_to_staging)  
+
+load_from_s3 >> files_wait >> load_to_staging
